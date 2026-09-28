@@ -10,72 +10,55 @@ use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
 
-// 1. Головна сторінка (передаємо останні 4 новини)
 Route::get('/', function () {
-    $posts = Post::where('is_published', true)
-        ->orderByDesc('published_at')
-        ->take(4)
-        ->get();
-
+    $posts = Post::where('is_published', true)->orderByDesc('published_at')->take(4)->get();
     return view('home', compact('posts'));
 });
 
-// 1.1. Сторінка читання новини (slug)
 Route::get('/news/{post:slug}', function (Post $post) {
-    if (!$post->is_published) {
-        abort(404);
-    }
+    if (!$post->is_published) abort(404);
     return view('news.show', compact('post'));
 })->name('news.show');
 
-// 2. Центр завантажень
 Route::get('/downloads', function () {
     $distributives = Distributive::where('is_active', true)->latest()->get();
     return view('downloads', compact('distributives'));
 });
 
-// 3. Захищений шлюз скачування через Nginx X-Accel-Redirect
+// ПРАВИЛЬНИЙ ПОТОКОВИЙ ШЛЮЗ ІЗ ПІДТРИМКОЮ RANGE-ЗАПИТІВ (206 PARTIAL CONTENT)
 Route::get('/downloads/{distributive}/download', function (Distributive $distributive) {
     if (!$distributive->is_active || !$distributive->file_path) {
-        abort(404, 'Дистрибутив не знайдено або знято з публікації.');
+        abort(404, 'Дистрибутив не знайдено.');
     }
 
-    // Перевірка: тільки для зареєстрованих
-    if ($distributive->access_level === 'registered') {
-        if (!Auth::check()) {
-            return redirect()->route('login')->withErrors(['email' => 'Для завантаження цього файлу необхідно увійти в акаунт.']);
-        }
+    if ($distributive->access_level === 'registered' && !Auth::check()) {
+        return redirect()->route('login');
     }
 
-    // Перевірка: тільки для клієнтів з активною ліцензією (VIP)
     if ($distributive->access_level === 'licensed') {
-        if (!Auth::check()) {
-            return redirect()->route('login')->withErrors(['email' => 'Для доступу до комерційного релізу необхідна авторизація.']);
-        }
-
-        if (!Auth::user()->hasActiveLicense()) {
-            abort(403, 'Доступ заборонено: у вашому обліковому записі відсутня активна ліцензія.');
+        if (!Auth::check() || !Auth::user()->hasActiveLicense()) {
+            abort(403, 'Відсутня ліцензія.');
         }
     }
 
-    if (!Storage::disk('public')->exists($distributive->file_path)) {
+    $fullPath = Storage::disk('public')->path($distributive->file_path);
+    if (!file_exists($fullPath)) {
         abort(404, 'Файл фізично відсутній на сервері.');
     }
 
-    // --- МАГІЯ NGINX X-ACCEL-REDIRECT ---
-    // PHP завершує роботу миттєво, віддаючи лише спеціальний заголовок Nginx
-    $fileName = basename($distributive->file_path);
     $extension = pathinfo($distributive->file_path, PATHINFO_EXTENSION) ?: 'iso';
+    $safeName = Str::slug($distributive->name, '_') ?: 'distributive';
+    $downloadName = $safeName . '_v' . $distributive->version . '.' . $extension;
 
-    return response('', 200, [
-        'X-Accel-Redirect' => '/protected_files/' . $fileName,
-        'Content-Type' => 'application/octet-stream',
-        'Content-Disposition' => 'attachment; filename="' . $distributive->name . '_v' . $distributive->version . '.' . $extension . '"',
+    // response()->download автоматично керує Range-заголовками, MIME-типами та докачуванням
+    return response()->download($fullPath, $downloadName, [
+        'Cache-Control' => 'no-store, no-cache, must-revalidate',
+        'Pragma' => 'no-cache',
     ]);
 })->name('distributives.download');
 
-// 4. Техпідтримка
 Route::get('/support', fn () => view('support'));
 Route::post('/tickets', function (Request $request) {
     $validated = $request->validate([
@@ -96,25 +79,18 @@ Route::post('/tickets', function (Request $request) {
         'status' => 'new',
     ]);
 
-    return back()->with('success', "Дякуємо! Ваш тікет #{$ticket->ticket_number} зареєстровано.");
+    return back()->with('success', "Дякуємо! Тікет #{$ticket->ticket_number} створено.");
 });
-
-// --- АВТОРИЗАЦІЯ ТА ОСОБИСТИЙ КАБІНЕТ ---
 
 Route::middleware('guest')->group(function () {
     Route::get('/login', fn () => view('auth.login'))->name('login');
     Route::post('/login', function (Request $request) {
-        $credentials = $request->validate([
-            'email' => 'required|email',
-            'password' => 'required',
-        ]);
-
+        $credentials = $request->validate(['email' => 'required|email', 'password' => 'required']);
         if (Auth::attempt($credentials)) {
             $request->session()->regenerate();
             return redirect()->intended('/cabinet');
         }
-
-        return back()->withErrors(['email' => 'Невірний email або пароль.']);
+        return back()->withErrors(['email' => 'Помилка авторизації.']);
     });
 
     Route::get('/register', fn () => view('auth.register'))->name('register');
@@ -124,13 +100,11 @@ Route::middleware('guest')->group(function () {
             'email' => 'required|email|unique:users,email',
             'password' => 'required|min:6|confirmed',
         ]);
-
         $user = User::create([
             'name' => $validated['name'],
             'email' => $validated['email'],
             'password' => Hash::make($validated['password']),
         ]);
-
         Auth::login($user);
         return redirect('/cabinet');
     });
@@ -139,11 +113,8 @@ Route::middleware('guest')->group(function () {
 Route::middleware('auth')->group(function () {
     Route::get('/cabinet', function () {
         $user = Auth::user();
-        $licenses = License::where('user_id', $user->id)
-            ->orWhere('client_email', $user->email)
-            ->get();
+        $licenses = License::where('user_id', $user->id)->orWhere('client_email', $user->email)->get();
         $tickets = Ticket::where('client_email', $user->email)->latest()->get();
-
         return view('cabinet', compact('user', 'licenses', 'tickets'));
     });
 
